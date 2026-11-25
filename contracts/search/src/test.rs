@@ -636,6 +636,68 @@ fn contract_search_pages_match_shared_pagination_boundaries() {
     }
 }
 
+// ── Issue #76: Reject invalid search query limits ────────────────────────────
+
+#[test]
+fn zero_page_size_is_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let artist = Address::generate(&env);
+    client.index_artist(&artist, &Vec::new(&env), &100_i128, &Vec::new(&env));
+
+    let filters = empty_filters(&env);
+    let err = client
+        .try_search(&filters, &SortBy::PriceAsc, &0, &0)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, SearchError::InvalidPageSize);
+}
+
+#[test]
+fn max_page_size_is_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let artist = Address::generate(&env);
+    client.index_artist(&artist, &Vec::new(&env), &100_i128, &Vec::new(&env));
+
+    let filters = empty_filters(&env);
+    // MAX_PAGE_SIZE (50) is the maximum accepted value.
+    let page = client.search(&filters, &SortBy::PriceAsc, &0, &MAX_PAGE_SIZE);
+    assert_eq!(page.results.len(), 1);
+}
+
+#[test]
+fn over_max_page_size_is_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let artist = Address::generate(&env);
+    client.index_artist(&artist, &Vec::new(&env), &100_i128, &Vec::new(&env));
+
+    let filters = empty_filters(&env);
+    let err = client
+        .try_search(&filters, &SortBy::PriceAsc, &0, &(MAX_PAGE_SIZE + 1))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, SearchError::InvalidPageSize);
+}
+
+#[test]
+fn default_non_zero_page_size_returns_results() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    for _ in 0..5u32 {
+        let artist = Address::generate(&env);
+        client.index_artist(&artist, &Vec::new(&env), &100_i128, &Vec::new(&env));
+    }
+
+    let filters = empty_filters(&env);
+    // Page size of 1 is the smallest non-zero valid value.
+    let page = client.search(&filters, &SortBy::PriceAsc, &0, &1);
+    assert_eq!(page.results.len(), 1);
+    assert_eq!(page.total_matches, 5);
+    assert_eq!(page.page_size, 1);
 // ── Issue #79: Keep search pagination stable during updates ──────────────────
 
 #[test]

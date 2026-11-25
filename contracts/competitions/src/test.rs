@@ -556,6 +556,108 @@ fn history_is_capped_at_the_configured_limit() {
     assert_eq!(f.client.get_history().len(), HISTORY_LIMIT);
 }
 
+// ── Issue #68: Conserve competition prize funds ──────────────────────────────
+
+#[test]
+fn distributed_prizes_plus_retained_funds_equal_prize_pool() {
+    let f = setup();
+    f.create();
+    f.submit(&f.alice);
+    f.submit(&f.bob);
+    f.client.set_reputation(&f.voter_one, &70);
+    f.open_voting();
+    f.client.vote(&f.id, &f.voter_one, &f.alice);
+    f.close_voting();
+    f.client.finalize(&f.id);
+    f.client.distribute_prizes(&f.id);
+
+    // All funds must have left the contract.
+    assert_eq!(f.balance(&f.client.address), 0);
+
+    // The sum paid to winners must equal the prize pool.
+    let winners = f.client.get_winners(&f.id);
+    let total_paid: i128 = winners.iter().map(|w| w.prize).sum();
+    assert_eq!(total_paid, PRIZE_POOL);
+}
+
+#[test]
+fn prize_conservation_holds_with_three_winners() {
+    let f = setup();
+    f.client.create_competition(
+        &f.id,
+        &f.organizer,
+        &f.token,
+        &String::from_str(&f.env, "Three way"),
+        &PRIZE_POOL,
+        &f.rules(vec![&f.env, 5_000, 3_000, 2_000]),
+    );
+    f.submit(&f.alice);
+    f.submit(&f.bob);
+    f.submit(&f.carol);
+    f.client.set_reputation(&f.voter_one, &10);
+    f.client.set_reputation(&f.voter_two, &10);
+    f.open_voting();
+    f.client.vote(&f.id, &f.voter_one, &f.alice);
+    f.client.vote(&f.id, &f.voter_two, &f.bob);
+    f.close_voting();
+    f.client.finalize(&f.id);
+    f.client.distribute_prizes(&f.id);
+
+    assert_eq!(f.balance(&f.client.address), 0);
+    let winners = f.client.get_winners(&f.id);
+    let total_paid: i128 = winners.iter().map(|w| w.prize).sum();
+    assert_eq!(total_paid, PRIZE_POOL);
+}
+
+// ── Issue #70: Check competition event budgets ───────────────────────────────
+
+#[test]
+fn settlement_completes_for_large_competition_with_max_positions() {
+    let f = setup();
+    // Build a competition with the maximum number of prize positions.
+    // Each position gets 1_000 bps (10 × 1_000 = 10_000).
+    let splits: Vec<u32> = {
+        let mut v = Vec::new(&f.env);
+        for _ in 0..10u32 {
+            v.push_back(1_000u32);
+        }
+        v
+    };
+    f.client.create_competition(
+        &f.id,
+        &f.organizer,
+        &f.token,
+        &String::from_str(&f.env, "Max positions"),
+        &PRIZE_POOL,
+        &CompetitionRules {
+            submission_ledgers: SUBMISSION_LEDGERS,
+            voting_ledgers: VOTING_LEDGERS,
+            max_submissions: 10,
+            min_reputation: MIN_REPUTATION,
+            prize_split_bps: splits,
+        },
+    );
+    // Submit 10 entries.
+    for _ in 0..10u32 {
+        let entrant = Address::generate(&f.env);
+        f.client.submit(
+            &f.id,
+            &entrant,
+            &String::from_str(&f.env, "ipfs://entry"),
+        );
+    }
+    f.open_voting();
+    f.close_voting();
+    // Finalize should succeed without exceeding event-size budget.
+    let winners = f.client.finalize(&f.id);
+    assert_eq!(winners.len(), 10);
+
+    // Distribute should also settle all 10 prizes cleanly.
+    f.client.distribute_prizes(&f.id);
+    assert_eq!(f.balance(&f.client.address), 0);
+
+    let total_paid: i128 = winners.iter().map(|w| w.prize).sum();
+    assert_eq!(total_paid, PRIZE_POOL);
 // ── Issue #66: Reject competition entries after closing ──────────────────────
 
 #[test]
