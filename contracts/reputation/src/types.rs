@@ -187,6 +187,10 @@ pub enum DataKey {
     QueueSize,
     /// Maintained rolling aggregate for a subject.
     Aggregate(Address),
+    /// Unique review key: `(artist, reviewer)` → the review id that client left
+    /// for that artist (#48). Its presence is what makes duplicate reviews
+    /// impossible, independently of the caller-chosen review id.
+    ReviewerIndex(Address, Address),
     /// Configured appeal window in ledgers.
     AppealWindowLedgers,
 }

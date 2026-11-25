@@ -16,6 +16,33 @@ pub const MAX_HISTORY: u32 = 100;
 /// At ~5 s/ledger: 12 ledgers ≈ 1 minute.
 pub const RATE_LIMIT_LEDGERS: u32 = 12;
 
+// ── Content policy ───────────────────────────────────────────────────────────
+
+/// Whether `body` is empty or made up only of ASCII whitespace (#055).
+///
+/// A message must contain at least one non-whitespace byte. The contract stores
+/// ciphertext verbatim, so it cannot inspect plaintext; rejecting blank
+/// payloads is the one content rule it can enforce at the boundary, and it
+/// keeps storage from being spent on messages with no content. The check is
+/// byte-wise: non-ASCII bytes (such as UTF-8 continuation bytes) count as
+/// content.
+pub fn is_blank_message_body(body: &String) -> bool {
+    let len = body.len() as usize;
+    if len == 0 {
+        return true;
+    }
+    // `send_message` rejects oversized bodies on its own; treat them as
+    // non-blank here so this helper is total for every `String`.
+    if len > MAX_MESSAGE_LEN as usize {
+        return false;
+    }
+    let mut bytes = [0u8; MAX_MESSAGE_LEN as usize];
+    body.copy_into_slice(&mut bytes[..len]);
+    bytes[..len]
+        .iter()
+        .all(|&byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /// A stored message. The `body` field holds the (optionally encrypted) content.

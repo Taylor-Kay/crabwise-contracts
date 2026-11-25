@@ -47,6 +47,10 @@ pub enum AgreementError {
     RevisionAlreadyResolved = 24,
     RevisionSameParty = 25,
     RateLimiterNotConfigured = 26,
+    /// A roster role change skipped a rung or was a no-op (closes #34).
+    InvalidRoleTransition = 33,
+    /// A batch settlement leg was rejected by the token contract (closes #35).
+    BatchTransferFailed = 34,
 }
 
 impl core::fmt::Display for AgreementError {
@@ -84,6 +88,8 @@ impl core::fmt::Display for AgreementError {
             Self::RevisionAlreadyResolved => write!(f, "revision has already been resolved"),
             Self::RevisionSameParty => write!(f, "the requesting party cannot resolve their own revision"),
             Self::RateLimiterNotConfigured => write!(f, "rate limiter contract not configured"),
+            Self::InvalidRoleTransition => write!(f, "roster role transition is not permitted"),
+            Self::BatchTransferFailed => write!(f, "a batch payout transfer failed"),
         }
     }
 }
@@ -123,5 +129,7 @@ pub fn get_suggestion(error: AgreementError) -> Symbol {
         AgreementError::RevisionAlreadyResolved => symbol_short!("REV_DONE"),
         AgreementError::RevisionSameParty => symbol_short!("REV_SELF"),
         AgreementError::RateLimiterNotConfigured => symbol_short!("NO_RL"),
+        AgreementError::InvalidRoleTransition => symbol_short!("BAD_ROLE"),
+        AgreementError::BatchTransferFailed => symbol_short!("XFER_FAIL"),
     }
 }

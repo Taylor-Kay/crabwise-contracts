@@ -1,5 +1,39 @@
 use soroban_sdk::{contracttype, Address, Bytes, String, Vec};
 
+use crate::errors::AnalyticsError;
+
+/// Largest span a single earnings query may cover, in ledgers.
+///
+/// ~30 days at 6 s/ledger. Bounding the window keeps one query from asking the
+/// contract to reason about an arbitrary slice of chain history, while staying
+/// well inside the retention period during which records are still live.
+pub const MAX_QUERY_WINDOW_LEDGERS: u32 = 432_000;
+
+/// Validate an inclusive ledger query window.
+///
+/// `from_ledger` and `to_ledger` are both included in the window. A window is
+/// valid when it is not inverted (`from_ledger <= to_ledger`) and its span does
+/// not exceed [`MAX_QUERY_WINDOW_LEDGERS`]. A zero-width window is valid: it
+/// asks for the records of a single ledger, and legitimately yields an empty
+/// result when none were recorded there.
+///
+/// Returns the span in ledgers so callers do not recompute it.
+pub fn validate_query_window(from_ledger: u32, to_ledger: u32) -> Result<u32, AnalyticsError> {
+    if to_ledger < from_ledger {
+        return Err(AnalyticsError::InvalidQueryWindow);
+    }
+    let span = to_ledger - from_ledger;
+    if span > MAX_QUERY_WINDOW_LEDGERS {
+        return Err(AnalyticsError::InvalidQueryWindow);
+    }
+    Ok(span)
+}
+
+/// True when `ledger` falls inside the inclusive window `[from, to]`.
+pub fn in_query_window(ledger: u32, from_ledger: u32, to_ledger: u32) -> bool {
+    ledger >= from_ledger && ledger <= to_ledger
+}
+
 /// A single earnings record tied to a completed commission.
 ///
 /// Tracks the category/client context for per-category and per-client

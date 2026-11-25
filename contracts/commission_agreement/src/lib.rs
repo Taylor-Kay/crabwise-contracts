@@ -45,8 +45,8 @@ mod cancellation_tests;
 #[cfg(test)]
 mod revision_tests;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Bytes, Env, IntoVal, String, Symbol, Vec};
-use agency::{AgencyAnalytics, AgencyProfile, BatchPayment, RosterEntry};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Bytes, Env, IntoVal, String, Symbol, Vec};
+use agency::{AgencyAnalytics, AgencyProfile, BatchPayment, RosterEntry, RosterRole};
 use cancellation::{CancellationPolicy, CancellationQuote, CancellationReason, CancellationRecord};
 use errors::AgreementError;
 use revision::{RevisionPolicy, RevisionRequest, RevisionStatus};
@@ -1141,6 +1141,7 @@ impl CommissionAgreementContract {
             artist: artist.clone(),
             split_bps,
             joined_ledger: env.ledger().sequence(),
+            role: RosterRole::Artist,
             commissions: 0,
             gross_distributed: 0,
             agency_revenue: 0,
@@ -1236,6 +1237,33 @@ impl CommissionAgreementContract {
         Ok(())
     }
 
+    /// Change an artist's roster role (closes #34).
+    ///
+    /// Only the agency may authorise the change. Transitions move exactly one
+    /// rung on the `Artist -> SeniorArtist -> Manager` ladder; a no-op or a jump
+    /// is rejected with `InvalidRoleTransition`. The artist stays on the roster
+    /// with the same split and running totals — only the role changes.
+    pub fn set_artist_role(
+        env: Env,
+        agency: Address,
+        artist: Address,
+        role: RosterRole,
+    ) -> Result<(), AgreementError> {
+        load_agency(&env, &agency)?;
+        agency.require_auth();
+
+        let mut entry = load_roster_entry(&env, &agency, &artist)?;
+        agency::validate_role_transition(entry.role, role)?;
+        entry.role = role;
+        env.storage()
+            .persistent()
+            .set(&DataKey::RosterEntry(agency.clone(), artist.clone()), &entry);
+
+        env.events()
+            .publish((symbol_short!("agy_role"),), (agency, artist, role));
+        Ok(())
+    }
+
     /// Pay a batch of rostered artists in one call. Each line is split by the
     /// artist's rostered rate: the agency keeps its cut and forwards the rest,
     /// and both halves are added to the running split totals.
@@ -1258,14 +1286,16 @@ impl CommissionAgreementContract {
         let mut analytics = load_analytics(&env, &agency);
 
         // Effects first: every roster entry and the analytics roll-up are
-        // committed before any token leaves the agency.
+        // committed before any token leaves the agency. The settlement helper
+        // returns an error if any line is rejected, which rolls all of these
+        // effects and the transfers already made back together (#35).
         let (nets, total_gross) = apply_batch_effects(&env, &agency, &payments, &mut analytics)?;
 
         analytics.batches += 1;
         analytics.gross_distributed += total_gross;
         save_analytics(&env, &agency, &analytics);
 
-        transfer_batch(&env, &token_address, &agency, &payments, &nets);
+        agency::settle_batch(&env, &token_address, &agency, &payments, &nets)?;
 
         env.events().publish(
             (symbol_short!("agy_batch"),),
@@ -1571,18 +1601,3 @@ fn apply_batch_effects(
     Ok((nets, total_gross))
 }
 
-fn transfer_batch(
-    env: &Env,
-    token_address: &Address,
-    agency: &Address,
-    payments: &Vec<BatchPayment>,
-    nets: &Vec<i128>,
-) {
-    let token_client = token::Client::new(env, token_address);
-    for (i, payment) in payments.iter().enumerate() {
-        let net = nets.get(i as u32).unwrap();
-        if net > 0 {
-            token_client.transfer(agency, &payment.artist, &net);
-        }
-    }
-}

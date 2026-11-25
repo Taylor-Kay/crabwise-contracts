@@ -422,6 +422,55 @@ impl AnalyticsContract {
         })
     }
 
+    /// Return the earnings records inside an inclusive ledger window (#45).
+    ///
+    /// `[from_ledger, to_ledger]` is validated before anything is read: an
+    /// inverted window, or one wider than
+    /// [`types::MAX_QUERY_WINDOW_LEDGERS`], is rejected with
+    /// [`AnalyticsError::InvalidQueryWindow`] rather than silently clamped. A
+    /// valid window that happens to contain no records is not an error — it
+    /// returns an empty vector, so a caller can query a quiet period directly.
+    ///
+    /// Like [`get_earnings`], the scan is bounded: at most
+    /// `min(limit, MAX_EARNING_PAGE)` indexes starting at `from_index` are
+    /// examined, so a caller pages through the log rather than making one
+    /// unbounded call. Records outside the window are skipped, so a page may be
+    /// shorter than `limit`.
+    pub fn get_earnings_in_window(
+        env: Env,
+        artist: Address,
+        from_ledger: u32,
+        to_ledger: u32,
+        from_index: u32,
+        limit: u32,
+    ) -> Result<soroban_sdk::Vec<EarningsRecord>, AnalyticsError> {
+        types::validate_query_window(from_ledger, to_ledger)?;
+
+        let cap = limit.min(MAX_EARNING_PAGE);
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EarningCount(artist.clone()))
+            .unwrap_or(0u32);
+        let end = from_index.saturating_add(cap).min(count);
+
+        let mut out: soroban_sdk::Vec<EarningsRecord> = soroban_sdk::Vec::new(&env);
+        let mut idx = from_index;
+        while idx < end {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, EarningsRecord>(&DataKey::Earning(artist.clone(), idx))
+            {
+                if types::in_query_window(record.ledger, from_ledger, to_ledger) {
+                    out.push_back(record);
+                }
+            }
+            idx = idx.saturating_add(1);
+        }
+        Ok(out)
+    }
+
     // ── Retention / pruning (#651) ───────────────────────────────────────
     //
     // Pruning in this contract is deliberately conservative and bounded:

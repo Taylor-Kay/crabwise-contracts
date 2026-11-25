@@ -464,6 +464,109 @@ fn test_get_earnings_returns_bounded_page() {
     assert_eq!(client.get_earnings(&artist, &0, &0).len(), 0);
 }
 
+// ── Query windows (#45) ─────────────────────────────────────────────────────
+
+/// An inverted window is rejected, not silently normalised.
+#[test]
+fn test_query_window_rejects_inverted_range() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+    let artist = Address::generate(&env);
+
+    assert_eq!(
+        client.try_get_earnings_in_window(&artist, &200, &100, &0, &10),
+        Err(Ok(AnalyticsError::InvalidQueryWindow)),
+    );
+}
+
+/// A window wider than the documented maximum is rejected, while a window of
+/// exactly the maximum span is accepted.
+#[test]
+fn test_query_window_enforces_maximum_span() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+    let artist = Address::generate(&env);
+    let max = crate::types::MAX_QUERY_WINDOW_LEDGERS;
+
+    assert_eq!(
+        client.try_get_earnings_in_window(&artist, &0, &(max + 1), &0, &10),
+        Err(Ok(AnalyticsError::InvalidQueryWindow)),
+    );
+    assert!(
+        client.try_get_earnings_in_window(&artist, &0, &max, &0, &10).is_ok(),
+        "a window of exactly the maximum span must be accepted",
+    );
+}
+
+/// A normal window returns only the records recorded inside it.
+#[test]
+fn test_query_window_returns_only_records_inside_it() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let cat = make_string(&env, "ui");
+    let record_at = |ledger: u32, amount: i128| {
+        set_ledger_seq(&env, &client, ledger);
+        client.record_earning(
+            &artist,
+            &make_bytes(&env, "c"),
+            &cat,
+            &client_addr,
+            &amount,
+        );
+    };
+    record_at(100, 100);
+    record_at(200, 200);
+    record_at(300, 300);
+
+    let inside = client.get_earnings_in_window(&artist, &150, &250, &0, &10);
+    assert_eq!(inside.len(), 1, "only the ledger-200 record is in range");
+    assert_eq!(inside.get(0).unwrap().amount, 200);
+
+    // Both bounds are inclusive.
+    let edges = client.get_earnings_in_window(&artist, &100, &300, &0, &10);
+    assert_eq!(edges.len(), 3);
+
+    // The page bound still applies, and paging continues past skipped records.
+    let first_page = client.get_earnings_in_window(&artist, &100, &300, &0, &2);
+    assert_eq!(first_page.len(), 2);
+    let second_page = client.get_earnings_in_window(&artist, &100, &300, &2, &2);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page.get(0).unwrap().amount, 300);
+}
+
+/// A valid window with no records — including a zero-width window — is an
+/// empty result, not an error.
+#[test]
+fn test_query_window_with_no_records_is_empty() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    set_ledger_seq(&env, &client, ledger_inside_window());
+    seed_earnings(&env, &client, &artist, 1);
+    let recorded_at = ledger_inside_window();
+
+    // An artist with history, queried in a period that holds none of it.
+    let quiet = client.get_earnings_in_window(&artist, &(recorded_at + 1), &(recorded_at + 100), &0, &10);
+    assert_eq!(quiet.len(), 0);
+
+    // A single-ledger window is valid even when nothing was recorded there.
+    let point = client.get_earnings_in_window(&artist, &(recorded_at + 1), &(recorded_at + 1), &0, &10);
+    assert_eq!(point.len(), 0);
+
+    // An artist with no earnings at all is empty too.
+    let unknown = Address::generate(&env);
+    let none = client.get_earnings_in_window(&unknown, &0, &100, &0, &10);
+    assert_eq!(none.len(), 0);
+}
+
 // ── Retention / pruning (#651) ──────────────────────────────────────────────
 
 /// Record `n` earnings of 1_000 each for `artist`, each carrying a distinct

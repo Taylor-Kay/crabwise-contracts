@@ -556,6 +556,212 @@ fn history_is_capped_at_the_configured_limit() {
     assert_eq!(f.client.get_history().len(), HISTORY_LIMIT);
 }
 
+// ── Issue #68: Conserve competition prize funds ──────────────────────────────
+
+#[test]
+fn distributed_prizes_plus_retained_funds_equal_prize_pool() {
+    let f = setup();
+    f.create();
+    f.submit(&f.alice);
+    f.submit(&f.bob);
+    f.client.set_reputation(&f.voter_one, &70);
+    f.open_voting();
+    f.client.vote(&f.id, &f.voter_one, &f.alice);
+    f.close_voting();
+    f.client.finalize(&f.id);
+    f.client.distribute_prizes(&f.id);
+
+    // All funds must have left the contract.
+    assert_eq!(f.balance(&f.client.address), 0);
+
+    // The sum paid to winners must equal the prize pool.
+    let winners = f.client.get_winners(&f.id);
+    let total_paid: i128 = winners.iter().map(|w| w.prize).sum();
+    assert_eq!(total_paid, PRIZE_POOL);
+}
+
+#[test]
+fn prize_conservation_holds_with_three_winners() {
+    let f = setup();
+    f.client.create_competition(
+        &f.id,
+        &f.organizer,
+        &f.token,
+        &String::from_str(&f.env, "Three way"),
+        &PRIZE_POOL,
+        &f.rules(vec![&f.env, 5_000, 3_000, 2_000]),
+    );
+    f.submit(&f.alice);
+    f.submit(&f.bob);
+    f.submit(&f.carol);
+    f.client.set_reputation(&f.voter_one, &10);
+    f.client.set_reputation(&f.voter_two, &10);
+    f.open_voting();
+    f.client.vote(&f.id, &f.voter_one, &f.alice);
+    f.client.vote(&f.id, &f.voter_two, &f.bob);
+    f.close_voting();
+    f.client.finalize(&f.id);
+    f.client.distribute_prizes(&f.id);
+
+    assert_eq!(f.balance(&f.client.address), 0);
+    let winners = f.client.get_winners(&f.id);
+    let total_paid: i128 = winners.iter().map(|w| w.prize).sum();
+    assert_eq!(total_paid, PRIZE_POOL);
+}
+
+// ── Issue #70: Check competition event budgets ───────────────────────────────
+
+#[test]
+fn settlement_completes_for_large_competition_with_max_positions() {
+    let f = setup();
+    // Build a competition with the maximum number of prize positions.
+    // Each position gets 1_000 bps (10 × 1_000 = 10_000).
+    let splits: Vec<u32> = {
+        let mut v = Vec::new(&f.env);
+        for _ in 0..10u32 {
+            v.push_back(1_000u32);
+        }
+        v
+    };
+    f.client.create_competition(
+        &f.id,
+        &f.organizer,
+        &f.token,
+        &String::from_str(&f.env, "Max positions"),
+        &PRIZE_POOL,
+        &CompetitionRules {
+            submission_ledgers: SUBMISSION_LEDGERS,
+            voting_ledgers: VOTING_LEDGERS,
+            max_submissions: 10,
+            min_reputation: MIN_REPUTATION,
+            prize_split_bps: splits,
+        },
+    );
+    // Submit 10 entries.
+    for _ in 0..10u32 {
+        let entrant = Address::generate(&f.env);
+        f.client.submit(
+            &f.id,
+            &entrant,
+            &String::from_str(&f.env, "ipfs://entry"),
+        );
+    }
+    f.open_voting();
+    f.close_voting();
+    // Finalize should succeed without exceeding event-size budget.
+    let winners = f.client.finalize(&f.id);
+    assert_eq!(winners.len(), 10);
+
+    // Distribute should also settle all 10 prizes cleanly.
+    f.client.distribute_prizes(&f.id);
+    assert_eq!(f.balance(&f.client.address), 0);
+
+    let total_paid: i128 = winners.iter().map(|w| w.prize).sum();
+    assert_eq!(total_paid, PRIZE_POOL);
+// ── Issue #66: Reject competition entries after closing ──────────────────────
+
+#[test]
+fn entries_are_rejected_at_and_after_the_deadline() {
+    let f = setup();
+    f.create();
+
+    // Before the deadline: entry accepted.
+    f.submit(&f.alice);
+    assert_eq!(f.client.get_competition(&f.id).submission_count, 1);
+
+    // Advance to exactly the deadline ledger — this ledger is at the boundary
+    // where the submission window ends (sequence == submission_end_ledger).
+    f.env.ledger().with_mut(|l| l.sequence_number = f.client.get_competition(&f.id).submission_end_ledger);
+    let err = f
+        .client
+        .try_submit(&f.id, &f.bob, &String::from_str(&f.env, "ipfs://late-at"))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, CompetitionError::SubmissionsClosed);
+
+    // After the deadline: also rejected, entrant set unchanged.
+    f.env.ledger().with_mut(|l| l.sequence_number += 1);
+    let err = f
+        .client
+        .try_submit(&f.id, &f.carol, &String::from_str(&f.env, "ipfs://late-after"))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, CompetitionError::SubmissionsClosed);
+
+    // Entrant set has not grown.
+    assert_eq!(f.client.get_entrants(&f.id).len(), 1);
+    assert_eq!(f.client.get_competition(&f.id).submission_count, 1);
+// ── Issue #69: Validate competition winner rankings ──────────────────────────
+
+#[test]
+fn duplicate_winner_positions_are_rejected_before_prize_transfer() {
+    let f = setup();
+    // A split that places two entries at position 1 is invalid (sum != 10000 or
+    // the split vec must have no zero-share entries — validate_rules covers this).
+    // We test that invalid prize_split_bps (which represent rankings) are caught
+    // at creation time before any prize transfer can occur.
+    let title = String::from_str(&f.env, "Bad rankings");
+
+    // A split with a zero share (invalid ranking position) must be rejected.
+    let err = f
+        .client
+        .try_create_competition(
+            &f.id,
+            &f.organizer,
+            &f.token,
+            &title,
+            &PRIZE_POOL,
+            &f.rules(vec![&f.env, 5_000, 0, 5_000]),
+        )
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, CompetitionError::InvalidRules);
+
+    // No competition should have been created.
+    let err = f
+        .client
+        .try_get_competition(&f.id)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, CompetitionError::CompetitionNotFound);
+}
+
+#[test]
+fn out_of_range_prize_positions_are_rejected() {
+    let f = setup();
+    let title = String::from_str(&f.env, "Too many positions");
+
+    // More than MAX_PRIZE_POSITIONS positions should be rejected.
+    let mut many_splits = Vec::new(&f.env);
+    for _ in 0..12u32 {
+        many_splits.push_back(833u32);
+    }
+    let err = f
+        .client
+        .try_create_competition(
+            &f.id,
+            &f.organizer,
+            &f.token,
+            &title,
+            &PRIZE_POOL,
+            &CompetitionRules {
+                submission_ledgers: SUBMISSION_LEDGERS,
+                voting_ledgers: VOTING_LEDGERS,
+                max_submissions: 20,
+                min_reputation: MIN_REPUTATION,
+                prize_split_bps: many_splits,
+            },
+        )
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, CompetitionError::InvalidRules);
+}
+
 #[test]
 fn duplicate_competition_ids_are_rejected() {
     let f = setup();

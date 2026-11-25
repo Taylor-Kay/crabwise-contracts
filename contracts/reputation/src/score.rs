@@ -21,7 +21,7 @@
 //! mean `search` reading this contract; that is a maintainer decision and is
 //! called out in the PR.
 
-use crate::types::{ReputationScore, ReviewAggregate};
+use crate::types::{ReputationScore, ReviewAggregate, ReviewStatus};
 
 /// Neutral prior rating, in tenths: `3.0`.
 pub const PRIOR_RATING_X10: u32 = 30;
@@ -75,6 +75,48 @@ pub fn weighted_score_x10(rating_sum: u32, active_reviews: u32) -> u32 {
         .checked_div(denominator)
         .unwrap_or(PRIOR_RATING_X10)
         .min(MAX_RATING_X10)
+}
+
+/// Whether a review in `status` counts toward the subject's rating.
+///
+/// Only `Removed` is excluded. A review that is `UnderReview` or `Cleared`
+/// still counts: a report is not a decision, so the rating stays in the
+/// aggregate until moderation actually removes it.
+pub fn counts_toward_score(status: ReviewStatus) -> bool {
+    status != ReviewStatus::Removed
+}
+
+/// Apply one validated review-status transition to the aggregate (#49).
+///
+/// All moderation and appeal paths go through this function so the adjustment
+/// is written once and in one place. It is driven by the `from`/`to` pair
+/// rather than by what the caller believes changed, which makes it idempotent:
+/// replaying a transition, or passing the same status twice, cannot adjust
+/// `active_reviews`, `rating_sum` or `removed_reviews` a second time.
+///
+/// Returns `true` when the aggregate changed, so callers can skip the write.
+pub fn apply_review_status_change(
+    aggregate: &mut ReviewAggregate,
+    rating_x10: u32,
+    from: ReviewStatus,
+    to: ReviewStatus,
+) -> bool {
+    match (counts_toward_score(from), counts_toward_score(to)) {
+        (true, false) => {
+            aggregate.active_reviews = aggregate.active_reviews.saturating_sub(1);
+            aggregate.rating_sum = aggregate.rating_sum.saturating_sub(rating_x10);
+            aggregate.removed_reviews = aggregate.removed_reviews.saturating_add(1);
+            true
+        }
+        (false, true) => {
+            aggregate.active_reviews = aggregate.active_reviews.saturating_add(1);
+            aggregate.rating_sum = aggregate.rating_sum.saturating_add(rating_x10);
+            aggregate.removed_reviews = aggregate.removed_reviews.saturating_sub(1);
+            true
+        }
+        // Both states are counted, or both are excluded: nothing to move.
+        _ => false,
+    }
 }
 
 /// Project a stored aggregate into the client-facing score.
@@ -174,6 +216,65 @@ mod tests {
     fn scores_are_saturating_on_absurd_inputs() {
         let _ = weighted_score_x10(u32::MAX, u32::MAX);
         let _ = average_rating_x10(u32::MAX, 1);
+    }
+
+    #[test]
+    fn only_removed_reviews_stop_counting() {
+        assert!(counts_toward_score(ReviewStatus::Active));
+        assert!(counts_toward_score(ReviewStatus::UnderReview));
+        assert!(counts_toward_score(ReviewStatus::Cleared));
+        assert!(!counts_toward_score(ReviewStatus::Removed));
+    }
+
+    #[test]
+    fn removal_and_restoration_move_the_aggregate_once_each_way() {
+        let env = Env::default();
+        let mut agg = aggregate(&env);
+        agg.total_reviews = 1;
+        agg.active_reviews = 1;
+        agg.rating_sum = 40;
+
+        assert!(apply_review_status_change(
+            &mut agg,
+            40,
+            ReviewStatus::UnderReview,
+            ReviewStatus::Removed
+        ));
+        assert_eq!(agg.active_reviews, 0);
+        assert_eq!(agg.rating_sum, 0);
+        assert_eq!(agg.removed_reviews, 1);
+
+        // A second removal call is a no-op, not a second decrement.
+        assert!(!apply_review_status_change(
+            &mut agg,
+            40,
+            ReviewStatus::Removed,
+            ReviewStatus::Removed
+        ));
+        assert_eq!(agg.active_reviews, 0);
+        assert_eq!(agg.rating_sum, 0);
+        assert_eq!(agg.removed_reviews, 1);
+
+        // Restoration puts the rating back exactly once.
+        assert!(apply_review_status_change(
+            &mut agg,
+            40,
+            ReviewStatus::Removed,
+            ReviewStatus::Active
+        ));
+        assert_eq!(agg.active_reviews, 1);
+        assert_eq!(agg.rating_sum, 40);
+        assert_eq!(agg.removed_reviews, 0);
+
+        assert!(!apply_review_status_change(
+            &mut agg,
+            40,
+            ReviewStatus::Active,
+            ReviewStatus::Cleared
+        ));
+        assert_eq!(agg.active_reviews, 1);
+        assert_eq!(agg.rating_sum, 40);
+        assert_eq!(agg.removed_reviews, 0);
     }
 
     #[test]

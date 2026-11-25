@@ -6,6 +6,7 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, symbol_short, Address, Bytes, Env, IntoVal, String};
 
+pub mod dispute_helpers;
 pub mod errors;
 pub mod types;
 
@@ -15,9 +16,14 @@ use types::{DataKey, DisputeRecord, DisputeStatus, EvidenceRecord};
 
 include!("../../semver_types.rs");
 
-/// Longest evidence blob a single submission may carry (#977). Bounded before
-/// it is written, like the resolution note (#765).
-const MAX_EVIDENCE_LEN: u32 = 1024;
+/// Longest evidence blob a single submission may carry (#977, #38).
+///
+/// The boundary is inclusive: a blob of exactly [`MAX_EVIDENCE_LEN`] bytes is
+/// accepted, and one byte more is rejected with
+/// [`DisputeError::EvidenceTooLong`] before any storage write, so an
+/// over-limit submission leaves the dispute untouched. Bounded before it is
+/// written, like the resolution note (#765).
+pub const MAX_EVIDENCE_LEN: u32 = 1024;
 
 #[contract]
 pub struct DisputeArbiter;
@@ -85,6 +91,20 @@ fn load_dispute(env: &Env, commission_id: &Bytes) -> Result<DisputeRecord, Dispu
         .persistent()
         .get(&DataKey::Dispute(commission_id.clone()))
         .unwrap())
+}
+
+/// Load a dispute that may still be resolved (#41).
+///
+/// Every state other than [`DisputeStatus::Open`] is terminal, so a second
+/// resolution must be refused here — before any escrow call — rather than
+/// after it. That is what stops a replayed resolution from overwriting the
+/// first decision or triggering a second downstream settlement.
+fn load_open_dispute(env: &Env, commission_id: &Bytes) -> Result<DisputeRecord, DisputeError> {
+    let record = load_dispute(env, commission_id)?;
+    if record.status != DisputeStatus::Open {
+        return Err(DisputeError::AlreadyResolved);
+    }
+    Ok(record)
 }
 
 fn save_dispute(env: &Env, record: &DisputeRecord) {
@@ -190,10 +210,9 @@ impl DisputeArbiter {
         if note.len() > shared::validation::MAX_MEMO_LEN {
             return Err(DisputeError::NoteTooLong);
         }
-        let mut record = load_dispute(&env, &commission_id)?;
-        if record.status != DisputeStatus::Open {
-            return Err(DisputeError::InvalidStatus);
-        }
+        // Terminal states are final: a second resolution is refused before the
+        // refund below, so it cannot overwrite the first decision (#41).
+        let mut record = load_open_dispute(&env, &commission_id)?;
         let escrow_contract = get_escrow_contract(&env)?;
         let config_contract = get_config_contract(&env)?;
         env.invoke_contract::<()>(
@@ -223,10 +242,8 @@ impl DisputeArbiter {
         if note.len() > shared::validation::MAX_MEMO_LEN {
             return Err(DisputeError::NoteTooLong);
         }
-        let mut record = load_dispute(&env, &commission_id)?;
-        if record.status != DisputeStatus::Open {
-            return Err(DisputeError::InvalidStatus);
-        }
+        // #41: refuse a replay before the release call, not after it.
+        let mut record = load_open_dispute(&env, &commission_id)?;
         let escrow_contract = get_escrow_contract(&env)?;
         let config_contract = get_config_contract(&env)?;
         env.invoke_contract::<()>(
@@ -260,10 +277,8 @@ impl DisputeArbiter {
         if note.len() > shared::validation::MAX_MEMO_LEN {
             return Err(DisputeError::NoteTooLong);
         }
-        let mut record = load_dispute(&env, &commission_id)?;
-        if record.status != DisputeStatus::Open {
-            return Err(DisputeError::InvalidStatus);
-        }
+        // #41: a split is a settlement too, so it gets the same terminal guard.
+        let mut record = load_open_dispute(&env, &commission_id)?;
         let escrow_contract = get_escrow_contract(&env)?;
         let config_contract = get_config_contract(&env)?;
 
@@ -336,15 +351,15 @@ impl DisputeArbiter {
     }
 
     pub fn auto_resolve(env: Env, commission_id: Bytes) -> Result<(), DisputeError> {
+        // Guard first (#762, #41): this settlement path calls escrow, so a
+        // re-entrant call from that refund could otherwise refund twice.
+        guard::acquire(&env);
         if !has_admin(&env) {
             return Err(DisputeError::NotInitialized);
         }
-        let mut record = load_dispute(&env, &commission_id)?;
-        if record.status != DisputeStatus::Open {
-            return Err(DisputeError::InvalidStatus);
-        }
+        let mut record = load_open_dispute(&env, &commission_id)?;
         let current_ledger = env.ledger().sequence();
-        if current_ledger < record.deadline_ledger {
+        if !record.window_closed_at(current_ledger) {
             return Err(DisputeError::AutoResolveNotDue);
         }
         let escrow_contract = get_escrow_contract(&env)?;
@@ -356,6 +371,7 @@ impl DisputeArbiter {
         );
         record.status = DisputeStatus::AutoResolved;
         save_dispute(&env, &record);
+        guard::release(&env);
         env.events()
             .publish((symbol_short!("auto_res"),), (commission_id, current_ledger));
         Ok(())
@@ -396,8 +412,12 @@ impl DisputeArbiter {
         Ok(())
     }
 
-    /// Ledger at which `commission_id`'s dispute stops accepting evidence and
-    /// becomes eligible for `auto_resolve` (#977).
+    /// Ledger at which `commission_id`'s dispute stops accepting evidence
+    /// (#977).
+    ///
+    /// This is the first ledger at which evidence is refused and `auto_resolve`
+    /// becomes callable; the ledger before it is the last one that accepts
+    /// evidence (#40).
     pub fn get_dispute_deadline(env: Env, commission_id: Bytes) -> Result<u32, DisputeError> {
         Ok(load_dispute(&env, &commission_id)?.deadline_ledger)
     }
@@ -409,11 +429,14 @@ impl DisputeArbiter {
         Ok(deadline.saturating_sub(env.ledger().sequence()))
     }
 
-    /// Submit one piece of evidence for an open dispute, up to its deadline.
+    /// Submit one piece of evidence for an open dispute, while its window is
+    /// still open.
     ///
-    /// The deadline is read before any state write (#977, #853). Submitting
-    /// after it is rejected with [`DisputeError::EvidenceWindowClosed`], so
-    /// evidence is time-boxed rather than open-ended.
+    /// The deadline is read before any state write (#977, #853). `deadline_ledger`
+    /// is the first ledger at which the window is closed, so a submission at
+    /// that ledger is rejected with [`DisputeError::EvidenceWindowClosed`]: the
+    /// same ledger at which `auto_resolve` becomes callable, which is what stops
+    /// the two windows from overlapping (#40).
     pub fn submit_evidence(
         env: Env,
         commission_id: Bytes,
@@ -427,6 +450,8 @@ impl DisputeArbiter {
             return Err(DisputeError::NotInitialized);
         }
         submitter.require_auth();
+        // Size boundary first (#38): reject an over-limit blob before the
+        // dispute is even read, so a rejected submission has no side effects.
         if evidence.len() > MAX_EVIDENCE_LEN {
             return Err(DisputeError::EvidenceTooLong);
         }
@@ -434,8 +459,10 @@ impl DisputeArbiter {
         if record.status != DisputeStatus::Open {
             return Err(DisputeError::InvalidStatus);
         }
-        // Deadline read before the write (#977, #853).
-        if env.ledger().sequence() > record.deadline_ledger {
+        // Deadline read before the write (#977, #853), and compared against the
+        // one boundary definition so evidence and auto-resolve can never both
+        // be live at the same ledger (#40).
+        if record.window_closed_at(env.ledger().sequence()) {
             return Err(DisputeError::EvidenceWindowClosed);
         }
 
@@ -462,6 +489,14 @@ impl DisputeArbiter {
             (commission_id, submitter, index),
         );
         Ok(())
+    }
+
+    /// The inclusive maximum evidence size in bytes (#38).
+    ///
+    /// Exposed so a client can enforce the same boundary before it builds a
+    /// submission, instead of discovering the limit from a failed call.
+    pub fn get_max_evidence_len(_env: Env) -> u32 {
+        MAX_EVIDENCE_LEN
     }
 
     /// How many evidence entries a dispute has accumulated.

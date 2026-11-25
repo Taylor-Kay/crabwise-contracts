@@ -27,6 +27,8 @@ pub enum MessagingError {
     CannotDeleteOthers = 10,
     /// Conversation already exists between these two participants.
     ConversationAlreadyExists = 11,
+    /// Message body is empty or contains only whitespace.
+    EmptyMessage = 12,
 }
 
 impl core::fmt::Display for MessagingError {
@@ -43,6 +45,7 @@ impl core::fmt::Display for MessagingError {
             Self::AlreadyDeleted => write!(f, "message is already deleted"),
             Self::CannotDeleteOthers => write!(f, "cannot delete another participant's message"),
             Self::ConversationAlreadyExists => write!(f, "conversation already exists"),
+            Self::EmptyMessage => write!(f, "message body must contain non-whitespace content"),
         }
     }
 }
@@ -60,5 +63,6 @@ pub fn get_suggestion(error: MessagingError) -> Symbol {
         MessagingError::AlreadyDeleted => symbol_short!("DELETED"),
         MessagingError::CannotDeleteOthers => symbol_short!("NOT_OWN"),
         MessagingError::ConversationAlreadyExists => symbol_short!("CONV_DUP"),
+        MessagingError::EmptyMessage => symbol_short!("EMPTY_MSG"),
     }
 }

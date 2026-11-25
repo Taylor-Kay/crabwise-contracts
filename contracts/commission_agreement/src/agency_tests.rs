@@ -6,7 +6,7 @@ use soroban_sdk::{
     token, vec, Address, Bytes, Env, IntoVal, String, Vec,
 };
 
-use crate::agency::BatchPayment;
+use crate::agency::{BatchPayment, RosterRole};
 use crate::errors::AgreementError;
 use crate::types::MilestoneStatus;
 use crate::{CommissionAgreementContract, CommissionAgreementContractClient};
@@ -125,6 +125,23 @@ impl Fixture<'_> {
                 sub_invokes: &[],
             },
         }]);
+    }
+
+    /// Restrict the mocked auth set to `actor` for one roster role change.
+    fn authorize_role_only(&self, actor: &Address, role: RosterRole) {
+        self.env.mock_auths(&[MockAuth {
+            address: actor,
+            invoke: &MockAuthInvoke {
+                contract: &self.contract_id,
+                fn_name: "set_artist_role",
+                args: (self.agency.clone(), self.artist.clone(), role).into_val(&self.env),
+                sub_invokes: &[],
+            },
+        }]);
+    }
+
+    fn role_of(&self, artist: &Address) -> RosterRole {
+        self.client_api.get_roster_entry(&self.agency, artist).role
     }
 
     fn milestone_status(&self, commission_id: &Bytes, milestone_id: &Bytes) -> MilestoneStatus {
@@ -607,6 +624,129 @@ fn non_positive_batch_lines_are_rejected() {
         .unwrap()
         .unwrap();
     assert_eq!(err, AgreementError::InvalidAmount);
+}
+
+// ── Roster role transitions (#34) ──────────────────────────────────────────
+
+#[test]
+fn a_newly_rostered_artist_starts_at_the_artist_role() {
+    let f = setup();
+    f.register_with_roster();
+    assert_eq!(f.role_of(&f.artist), RosterRole::Artist);
+    assert_eq!(f.role_of(&f.other_artist), RosterRole::Artist);
+}
+
+#[test]
+fn role_promotions_move_one_rung_and_preserve_roster_state() {
+    let f = setup();
+    f.register_with_roster();
+    let before = f.client_api.get_roster_entry(&f.agency, &f.artist);
+
+    f.client_api
+        .set_artist_role(&f.agency, &f.artist, &RosterRole::SeniorArtist);
+    assert_eq!(f.role_of(&f.artist), RosterRole::SeniorArtist);
+
+    f.client_api
+        .set_artist_role(&f.agency, &f.artist, &RosterRole::Manager);
+    assert_eq!(f.role_of(&f.artist), RosterRole::Manager);
+
+    // Membership, split and history survive the promotions untouched.
+    let after = f.client_api.get_roster_entry(&f.agency, &f.artist);
+    assert_eq!(after.split_bps, before.split_bps);
+    assert_eq!(after.joined_ledger, before.joined_ledger);
+    assert_eq!(after.commissions, before.commissions);
+    assert_eq!(after.gross_distributed, before.gross_distributed);
+    assert_eq!(after.agency_revenue, before.agency_revenue);
+    assert_eq!(after.artist_payouts, before.artist_payouts);
+    assert_eq!(f.client_api.get_roster(&f.agency).len(), 2);
+    assert_eq!(f.client_api.get_agency(&f.agency).artist_count, 2);
+}
+
+#[test]
+fn role_demotions_move_one_rung() {
+    let f = setup();
+    f.register_with_roster();
+    f.client_api
+        .set_artist_role(&f.agency, &f.artist, &RosterRole::SeniorArtist);
+    f.client_api
+        .set_artist_role(&f.agency, &f.artist, &RosterRole::Manager);
+
+    f.client_api
+        .set_artist_role(&f.agency, &f.artist, &RosterRole::SeniorArtist);
+    assert_eq!(f.role_of(&f.artist), RosterRole::SeniorArtist);
+
+    f.client_api
+        .set_artist_role(&f.agency, &f.artist, &RosterRole::Artist);
+    assert_eq!(f.role_of(&f.artist), RosterRole::Artist);
+    assert_eq!(f.client_api.get_roster(&f.agency).len(), 2);
+}
+
+#[test]
+fn skipping_a_role_rung_is_rejected() {
+    let f = setup();
+    f.register_with_roster();
+
+    let err = f
+        .client_api
+        .try_set_artist_role(&f.agency, &f.artist, &RosterRole::Manager)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, AgreementError::InvalidRoleTransition);
+
+    f.client_api
+        .set_artist_role(&f.agency, &f.artist, &RosterRole::SeniorArtist);
+    f.client_api
+        .set_artist_role(&f.agency, &f.artist, &RosterRole::Manager);
+    let err = f
+        .client_api
+        .try_set_artist_role(&f.agency, &f.artist, &RosterRole::Artist)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, AgreementError::InvalidRoleTransition);
+    assert_eq!(f.role_of(&f.artist), RosterRole::Manager);
+}
+
+#[test]
+fn repeating_the_current_role_is_rejected() {
+    let f = setup();
+    f.register_with_roster();
+    let err = f
+        .client_api
+        .try_set_artist_role(&f.agency, &f.artist, &RosterRole::Artist)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, AgreementError::InvalidRoleTransition);
+}
+
+#[test]
+fn a_role_change_requires_agency_authorization() {
+    let f = setup();
+    f.register_with_roster();
+    let stranger = Address::generate(&f.env);
+
+    f.authorize_role_only(&stranger, RosterRole::SeniorArtist);
+    assert!(f
+        .client_api
+        .try_set_artist_role(&f.agency, &f.artist, &RosterRole::SeniorArtist)
+        .is_err());
+    assert_eq!(f.role_of(&f.artist), RosterRole::Artist);
+}
+
+#[test]
+fn a_role_change_for_an_unrostered_artist_is_rejected() {
+    let f = setup();
+    f.register_with_roster();
+    let stranger = Address::generate(&f.env);
+    let err = f
+        .client_api
+        .try_set_artist_role(&f.agency, &stranger, &RosterRole::SeniorArtist)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, AgreementError::ArtistNotOnRoster);
 }
 
 #[test]

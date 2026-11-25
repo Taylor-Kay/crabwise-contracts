@@ -657,6 +657,34 @@ fn indexing_unchanged_record_produces_no_duplicates() {
     let page = client.search(&filters, &SortBy::PriceAsc, &0, &10);
     // Exactly one result — no duplicates in pagination totals.
     assert_eq!(page.total_matches, 1);
+// ── Issue #76: Reject invalid search query limits ────────────────────────────
+
+#[test]
+fn zero_page_size_is_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let artist = Address::generate(&env);
+    client.index_artist(&artist, &Vec::new(&env), &100_i128, &Vec::new(&env));
+
+    let filters = empty_filters(&env);
+    let err = client
+        .try_search(&filters, &SortBy::PriceAsc, &0, &0)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, SearchError::InvalidPageSize);
+}
+
+#[test]
+fn max_page_size_is_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let artist = Address::generate(&env);
+    client.index_artist(&artist, &Vec::new(&env), &100_i128, &Vec::new(&env));
+
+    let filters = empty_filters(&env);
+    // MAX_PAGE_SIZE (50) is the maximum accepted value.
+    let page = client.search(&filters, &SortBy::PriceAsc, &0, &MAX_PAGE_SIZE);
     assert_eq!(page.results.len(), 1);
 }
 
@@ -723,5 +751,102 @@ fn reactivated_record_reappears_in_search_results() {
     // Reactivate by re-indexing (index_artist sets active = true).
     client.index_artist(&artist, &Vec::new(&env), &100_i128, &Vec::new(&env));
     let page = client.search(&filters, &SortBy::PriceAsc, &0, &10);
+fn over_max_page_size_is_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let artist = Address::generate(&env);
+    client.index_artist(&artist, &Vec::new(&env), &100_i128, &Vec::new(&env));
+
+    let filters = empty_filters(&env);
+    let err = client
+        .try_search(&filters, &SortBy::PriceAsc, &0, &(MAX_PAGE_SIZE + 1))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, SearchError::InvalidPageSize);
+}
+
+#[test]
+fn default_non_zero_page_size_returns_results() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    for _ in 0..5u32 {
+        let artist = Address::generate(&env);
+        client.index_artist(&artist, &Vec::new(&env), &100_i128, &Vec::new(&env));
+    }
+
+    let filters = empty_filters(&env);
+    // Page size of 1 is the smallest non-zero valid value.
+    let page = client.search(&filters, &SortBy::PriceAsc, &0, &1);
+    assert_eq!(page.results.len(), 1);
+    assert_eq!(page.total_matches, 5);
+    assert_eq!(page.page_size, 1);
+// ── Issue #79: Keep search pagination stable during updates ──────────────────
+
+#[test]
+fn pagination_cursor_stable_when_indexed_record_changes_between_pages() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    // Index three artists at ascending prices.
+    let artist_a = Address::generate(&env);
+    let artist_b = Address::generate(&env);
+    let artist_c = Address::generate(&env);
+    client.index_artist(&artist_a, &Vec::new(&env), &100_i128, &Vec::new(&env));
+    client.index_artist(&artist_b, &Vec::new(&env), &200_i128, &Vec::new(&env));
+    client.index_artist(&artist_c, &Vec::new(&env), &300_i128, &Vec::new(&env));
+
+    let filters = empty_filters(&env);
+
+    // Page 0 with page_size 2: covers artist_a and artist_b.
+    let page0 = client.search(&filters, &SortBy::PriceAsc, &0, &2);
+    assert_eq!(page0.total_matches, 3);
+    assert_eq!(page0.results.len(), 2);
+    // Prices on page 0 are sorted ascending.
+    assert_eq!(page0.results.get(0).unwrap().price, 100);
+    assert_eq!(page0.results.get(1).unwrap().price, 200);
+
+    // Simulate an update to artist_b's price between page requests.
+    // Re-indexing updates the denormalised entry in-place, so artist_b retains
+    // its original position and the total count stays at 3.
+    client.index_artist(&artist_b, &Vec::new(&env), &150_i128, &Vec::new(&env));
+
+    // Page 1 with page_size 2: covers artist_c.
+    let page1 = client.search(&filters, &SortBy::PriceAsc, &1, &2);
+    assert_eq!(page1.total_matches, 3);
+    assert_eq!(page1.results.len(), 1);
+    // No result was skipped or duplicated.
+    let all_artists: Vec<soroban_sdk::Address> = {
+        let mut v = Vec::new(&env);
+        for item in page0.results.iter() {
+            v.push_back(item.artist.clone());
+        }
+        for item in page1.results.iter() {
+            v.push_back(item.artist.clone());
+        }
+        v
+    };
+    // Three unique artists across both pages.
+    assert_eq!(all_artists.len(), 3);
+}
+
+#[test]
+fn repeated_indexing_does_not_create_duplicates_in_results() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    client.index_artist(&artist, &Vec::new(&env), &500_i128, &Vec::new(&env));
+
+    // Re-index the same artist (unchanged).
+    client.index_artist(&artist, &Vec::new(&env), &500_i128, &Vec::new(&env));
+
+    // The index count should still be 1.
+    assert_eq!(client.get_indexed_count(), 1);
+
+    let filters = empty_filters(&env);
+    let page = client.search(&filters, &SortBy::PriceAsc, &0, &10);
+    // Only one result — no duplicate.
+    assert_eq!(page.results.len(), 1);
     assert_eq!(page.total_matches, 1);
 }

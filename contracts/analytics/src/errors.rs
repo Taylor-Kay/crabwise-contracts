@@ -22,6 +22,9 @@ pub enum AnalyticsError {
     ArithmeticOverflow = 6,
     /// The satisfaction score is outside the allowed 1–50 range (1–5 × 10).
     InvalidScore = 7,
+    /// A query window is inverted or wider than
+    /// [`MAX_QUERY_WINDOW_LEDGERS`](crate::types::MAX_QUERY_WINDOW_LEDGERS).
+    InvalidQueryWindow = 8,
     /// The stored aggregate is internally inconsistent — a sum with a zero
     /// sample count — so no metric value can be derived from it (#46).
     ///
@@ -40,6 +43,9 @@ impl core::fmt::Display for AnalyticsError {
             Self::NotFound => write!(f, "no metrics found for artist"),
             Self::ArithmeticOverflow => write!(f, "arithmetic operation would overflow"),
             Self::InvalidScore => write!(f, "satisfaction score must be between 10 and 50"),
+            Self::InvalidQueryWindow => {
+                write!(f, "query window is inverted or exceeds the maximum span")
+            }
             Self::InvalidMetricData => write!(f, "stored metric data is inconsistent"),
         }
     }
@@ -55,6 +61,7 @@ pub fn get_suggestion(error: AnalyticsError) -> Symbol {
         AnalyticsError::NotFound => symbol_short!("NOT_FOUND"),
         AnalyticsError::ArithmeticOverflow => symbol_short!("OVERFL"),
         AnalyticsError::InvalidScore => symbol_short!("BAD_SCR"),
+        AnalyticsError::InvalidQueryWindow => symbol_short!("BAD_WIN"),
         AnalyticsError::InvalidMetricData => symbol_short!("BAD_DATA"),
     }
 }

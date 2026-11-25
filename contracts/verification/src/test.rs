@@ -579,6 +579,136 @@ fn badge_active_before_expiry_expired_at_boundary_renewable_after() {
     assert_eq!(history.len(), 2);
     assert_eq!(history.get(0).unwrap().action, BadgeAction::Issued);
     assert_eq!(history.get(1).unwrap().action, BadgeAction::Renewed);
+// ── Issue #71: Make verification status transitions monotonic ────────────────
+
+#[test]
+fn pending_to_approved_then_rejected_is_not_allowed() {
+    let f = setup();
+    f.client.submit_portfolio(&f.artist, &uri(&f.env), &5);
+    f.client.start_review(&f.reviewer, &f.artist);
+    // Approve the portfolio.
+    f.client.review_portfolio(&f.reviewer, &f.artist, &quality(80), &note(&f.env));
+    assert_eq!(f.client.get_portfolio(&f.artist).status, PortfolioStatus::Verified);
+
+    // A second review attempt must be rejected — status is already terminal.
+    let err = f
+        .client
+        .try_review_portfolio(&f.reviewer, &f.artist, &quality(50), &note(&f.env))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VerificationError::InvalidStatus);
+    // Status must remain Verified.
+    assert_eq!(f.client.get_portfolio(&f.artist).status, PortfolioStatus::Verified);
+}
+
+#[test]
+fn pending_to_rejected_then_approved_is_not_allowed() {
+    let f = setup();
+    f.client.submit_portfolio(&f.artist, &uri(&f.env), &5);
+    f.client.start_review(&f.reviewer, &f.artist);
+    // Reject the portfolio.
+    f.client.review_portfolio(&f.reviewer, &f.artist, &quality(50), &note(&f.env));
+    assert_eq!(f.client.get_portfolio(&f.artist).status, PortfolioStatus::Rejected);
+
+    // A second review must be rejected — status is already terminal.
+    let err = f
+        .client
+        .try_review_portfolio(&f.reviewer, &f.artist, &quality(80), &note(&f.env))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VerificationError::InvalidStatus);
+    assert_eq!(f.client.get_portfolio(&f.artist).status, PortfolioStatus::Rejected);
+// ── Issue #72: Enforce verification evidence limits ──────────────────────────
+
+#[test]
+fn invalid_work_count_is_rejected_without_creating_partial_record() {
+    let f = setup();
+
+    // A submission below the minimum work count must be rejected.
+    let below_min = MIN_WORK_COUNT - 1;
+    let err = f
+        .client
+        .try_submit_portfolio(&f.artist, &uri(&f.env), &below_min)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VerificationError::InvalidWorkCount);
+
+    // No partial portfolio record should have been created.
+    let err = f
+        .client
+        .try_get_portfolio(&f.artist)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VerificationError::PortfolioNotFound);
+
+    // Exactly at the minimum work count must succeed.
+    f.client
+        .submit_portfolio(&f.artist, &uri(&f.env), &MIN_WORK_COUNT)
+        .unwrap();
+    let portfolio = f.client.get_portfolio(&f.artist);
+    assert_eq!(portfolio.work_count, MIN_WORK_COUNT);
+    assert_eq!(portfolio.status, PortfolioStatus::Submitted);
+// ── Issue #73: Prevent unauthorized verification decisions ──────────────────
+
+#[test]
+fn authorized_verifier_can_make_decisions() {
+    let f = setup();
+    f.client.submit_portfolio(&f.artist, &uri(&f.env), &5);
+    f.client.start_review(&f.reviewer, &f.artist);
+    // Authorized reviewer approves — should succeed.
+    f.client.review_portfolio(&f.reviewer, &f.artist, &quality(80), &note(&f.env));
+    assert_eq!(
+        f.client.get_portfolio(&f.artist).status,
+        PortfolioStatus::Verified
+    );
+}
+
+#[test]
+fn applicant_cannot_make_verification_decisions() {
+    let f = setup();
+    f.client.submit_portfolio(&f.artist, &uri(&f.env), &5);
+    f.client.start_review(&f.reviewer, &f.artist);
+
+    // The applicant (artist) is not a reviewer — decision must be refused.
+    let err = f
+        .client
+        .try_review_portfolio(&f.artist, &f.artist, &quality(80), &note(&f.env))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VerificationError::Unauthorized);
+
+    // Portfolio status must be unchanged.
+    assert_eq!(
+        f.client.get_portfolio(&f.artist).status,
+        PortfolioStatus::UnderReview
+    );
+}
+
+#[test]
+fn unrelated_address_cannot_make_verification_decisions() {
+    let f = setup();
+    f.client.submit_portfolio(&f.artist, &uri(&f.env), &5);
+    f.client.start_review(&f.reviewer, &f.artist);
+
+    let unrelated = Address::generate(&f.env);
+    let err = f
+        .client
+        .try_review_portfolio(&unrelated, &f.artist, &quality(80), &note(&f.env))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, VerificationError::Unauthorized);
+
+    // Portfolio status must be unchanged.
+    assert_eq!(
+        f.client.get_portfolio(&f.artist).status,
+        PortfolioStatus::UnderReview
+    );
 }
 
 #[test]

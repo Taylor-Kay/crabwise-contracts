@@ -21,8 +21,8 @@ use soroban_sdk::{
 
 use errors::MessagingError;
 use types::{
-    Conversation, DataKey, Message, ReadReceipt, TypingIndicator, MAX_CONV_ID_LEN,
-    MAX_MESSAGE_LEN, MAX_HISTORY, RATE_LIMIT_LEDGERS,
+    is_blank_message_body, Conversation, DataKey, Message, ReadReceipt, TypingIndicator,
+    MAX_CONV_ID_LEN, MAX_MESSAGE_LEN, MAX_HISTORY, RATE_LIMIT_LEDGERS,
 };
 
 include!("../../semver_types.rs");
@@ -105,10 +105,12 @@ impl MessagingContract {
     ///
     /// The `body` field should contain the encrypted ciphertext produced by
     /// client-side encryption. The contract stores it verbatim without
-    /// inspecting plaintext content.
+    /// inspecting plaintext content, but rejects an empty or whitespace-only
+    /// payload (#055) — see [`is_blank_message_body`].
     ///
     /// Rate limiting: a sender may send at most 1 message per `RATE_LIMIT_LEDGERS`
-    /// per conversation to prevent spam.
+    /// per conversation to prevent spam. Blank bodies are rejected before the
+    /// rate-limit slot is consumed.
     ///
     /// Closes #596.
     pub fn send_message(
@@ -122,6 +124,12 @@ impl MessagingContract {
         // ── Input validation ──────────────────────────────────────────────
         if body.len() > MAX_MESSAGE_LEN {
             return Err(MessagingError::MessageTooLong);
+        }
+        // #055: reject empty and whitespace-only bodies before touching the
+        // rate-limit slot, so a rejected send does not count as the sender's
+        // one message for this window.
+        if is_blank_message_body(&body) {
+            return Err(MessagingError::EmptyMessage);
         }
 
         // ── Load conversation and verify sender is a participant ───────────
@@ -551,6 +559,36 @@ mod test {
     }
 
     #[test]
+    fn test_empty_and_whitespace_only_messages_are_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MessagingContract);
+        let client = MessagingContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.initialize(&admin);
+        let conv_id = soroban_sdk::Bytes::from_slice(&env, b"conv-blank");
+        client.create_conversation(&conv_id, &alice, &bob);
+
+        env.ledger().with_mut(|l| l.sequence_number = RATE_LIMIT_LEDGERS + 1);
+
+        for blank in ["", " ", "   ", "\t\n\r", " \t \n "] {
+            let result = client.try_send_message(&conv_id, &alice, &String::from_str(&env, blank));
+            assert_eq!(result, Err(Ok(MessagingError::EmptyMessage)), "body {blank:?}");
+        }
+        // Rejected sends must not persist or consume the rate-limit slot.
+        assert_eq!(client.get_conversation(&conv_id).message_count, 0);
+
+        let body = String::from_str(&env, "  hello  ");
+        let seq = client.send_message(&conv_id, &alice, &body);
+        assert_eq!(seq, 1);
+        assert_eq!(client.get_messages(&conv_id, &alice, &1, &1).get(0).unwrap().body, body);
+    }
+
+    #[test]
     fn test_messages_page_clamps_limit_and_pages_past_the_end() {
         let env = Env::default();
         env.mock_all_auths();
@@ -785,6 +823,203 @@ mod test {
         env.ledger().with_mut(|l| l.sequence_number = RATE_LIMIT_LEDGERS + 1);
         let result = client.try_send_message(&conv_id, &charlie, &String::from_str(&env, "hack"));
         assert!(result.is_err());
+    }
+
+    // ── Issue #59: Return explicit errors for missing conversations ───────────
+
+    #[test]
+    fn test_missing_conversation_returns_explicit_error() {
+    // ── Issue #56: Enforce a maximum message payload ───────────────────────
+
+    #[test]
+    fn test_oversized_message_body_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MessagingContract);
+        let client = MessagingContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        let missing_id = soroban_sdk::Bytes::from_slice(&env, b"conv-does-not-exist");
+
+        // get_conversation on a missing ID returns ConversationNotFound, not an empty message list.
+        let err = client
+            .try_get_conversation(&missing_id)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, MessagingError::ConversationNotFound);
+
+        // get_messages on a missing conversation also returns ConversationNotFound.
+        let err = client
+            .try_get_messages(&missing_id, &alice, &1, &10)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, MessagingError::ConversationNotFound);
+
+        // A real conversation with no messages returns an empty list, not an error.
+        let bob = Address::generate(&env);
+        let real_id = soroban_sdk::Bytes::from_slice(&env, b"conv-real");
+        client.create_conversation(&real_id, &alice, &bob);
+        let msgs = client.get_messages(&real_id, &alice, &1, &10);
+        assert_eq!(msgs.len(), 0);
+        let bob = Address::generate(&env);
+
+        client.initialize(&admin);
+        let conv_id = soroban_sdk::Bytes::from_slice(&env, b"conv-payload");
+        client.create_conversation(&conv_id, &alice, &bob);
+
+        env.ledger().with_mut(|l| l.sequence_number = RATE_LIMIT_LEDGERS + 1);
+
+        // A body exactly at MAX_MESSAGE_LEN must succeed.
+        let boundary_body = String::from_bytes(&env, &soroban_sdk::Bytes::from_slice(
+            &env,
+            &[b'x'; MAX_MESSAGE_LEN as usize],
+        ));
+        let result = client.try_send_message(&conv_id, &alice, &boundary_body);
+        assert!(result.is_ok(), "boundary-sized message should succeed");
+
+        env.ledger().with_mut(|l| l.sequence_number += RATE_LIMIT_LEDGERS + 1);
+
+        // A body one byte over the limit must be rejected with MessageTooLong.
+        let oversized_body = String::from_bytes(&env, &soroban_sdk::Bytes::from_slice(
+            &env,
+            &[b'x'; MAX_MESSAGE_LEN as usize + 1],
+        ));
+        let err = client
+            .try_send_message(&conv_id, &alice, &oversized_body)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, MessagingError::MessageTooLong);
+    }
+
+    // ── Issue #57: Prevent unauthorized conversation reads ─────────────────
+
+    #[test]
+    fn test_non_participant_cannot_read_messages() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MessagingContract);
+        let client = MessagingContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let eve = Address::generate(&env);
+
+        client.initialize(&admin);
+        let conv_id = soroban_sdk::Bytes::from_slice(&env, b"conv-access");
+        client.create_conversation(&conv_id, &alice, &bob);
+
+        env.ledger().with_mut(|l| l.sequence_number = RATE_LIMIT_LEDGERS + 1);
+        client.send_message(&conv_id, &alice, &String::from_str(&env, "private"));
+
+        // A participant (alice) can read messages.
+        let msgs = client.get_messages(&conv_id, &alice, &1, &10);
+        assert_eq!(msgs.len(), 1);
+
+        // The other participant (bob) can also read.
+        let msgs = client.get_messages(&conv_id, &bob, &1, &10);
+        assert_eq!(msgs.len(), 1);
+
+        // A non-participant (eve) is rejected.
+        let err = client
+            .try_get_messages(&conv_id, &eve, &1, &10)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, MessagingError::Unauthorized);
+    }
+
+    #[test]
+    fn test_participant_identity_preserved_in_conversation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MessagingContract);
+        let client = MessagingContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.initialize(&admin);
+        let conv_id = soroban_sdk::Bytes::from_slice(&env, b"conv-identity");
+        client.create_conversation(&conv_id, &alice, &bob);
+
+        let conv = client.get_conversation(&conv_id);
+        assert_eq!(conv.participant_a, alice);
+        assert_eq!(conv.participant_b, bob);
+    }
+
+    // ── Issue #58: Make message ordering deterministic ─────────────────────
+
+    #[test]
+    fn test_messages_have_stable_sequence_numbers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MessagingContract);
+        let client = MessagingContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.initialize(&admin);
+        let conv_id = soroban_sdk::Bytes::from_slice(&env, b"conv-order");
+        client.create_conversation(&conv_id, &alice, &bob);
+
+        // Send three messages from different senders in different ledgers.
+        env.ledger().with_mut(|l| l.sequence_number = RATE_LIMIT_LEDGERS + 1);
+        let seq1 = client.send_message(&conv_id, &alice, &String::from_str(&env, "first"));
+        env.ledger().with_mut(|l| l.sequence_number += RATE_LIMIT_LEDGERS + 1);
+        let seq2 = client.send_message(&conv_id, &bob, &String::from_str(&env, "second"));
+        env.ledger().with_mut(|l| l.sequence_number += RATE_LIMIT_LEDGERS + 1);
+        let seq3 = client.send_message(&conv_id, &alice, &String::from_str(&env, "third"));
+
+        // Sequence numbers must be strictly increasing and 1-based.
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2);
+        assert_eq!(seq3, 3);
+
+        // Retrieval order must match send order.
+        let messages = client.get_messages(&conv_id, &alice, &1, &10);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.get(0).unwrap().body, String::from_str(&env, "first"));
+        assert_eq!(messages.get(1).unwrap().body, String::from_str(&env, "second"));
+        assert_eq!(messages.get(2).unwrap().body, String::from_str(&env, "third"));
+    }
+
+    #[test]
+    fn test_message_records_contain_ordering_metadata() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MessagingContract);
+        let client = MessagingContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.initialize(&admin);
+        let conv_id = soroban_sdk::Bytes::from_slice(&env, b"conv-metadata");
+        client.create_conversation(&conv_id, &alice, &bob);
+
+        env.ledger().with_mut(|l| l.sequence_number = RATE_LIMIT_LEDGERS + 1);
+        let ledger_at_send = env.ledger().sequence();
+        client.send_message(&conv_id, &alice, &String::from_str(&env, "hello"));
+
+        let messages = client.get_messages(&conv_id, &alice, &1, &1);
+        let msg = messages.get(0).unwrap();
+
+        // The message record preserves the sender and ledger (ordering metadata).
+        assert_eq!(msg.sender, alice);
+        assert_eq!(msg.sent_ledger, ledger_at_send);
+        assert!(!msg.message_id.is_empty());
     }
 
     #[test]

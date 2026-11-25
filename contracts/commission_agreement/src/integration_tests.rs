@@ -8,10 +8,11 @@
 #![cfg(test)]
 
 use soroban_sdk::{
-    symbol_short,
+    symbol_short, token,
     testutils::{Address as _, Events, Ledger},
-    Address, Bytes, Env, IntoVal, String, Symbol,
+    vec, Address, Bytes, Env, IntoVal, String, Symbol,
 };
+use crate::agency::BatchPayment;
 use crate::cancellation::CancellationReason;
 use crate::types::{AgreementStatus, MilestoneStatus};
 use crate::errors::AgreementError;
@@ -500,4 +501,119 @@ fn test_dispute_auto_resolve_zero_window() {
     let auto_resolve_at = dispute_ledger + auto_resolve_ledgers;
     let current: u32 = 200;
     assert!(current >= auto_resolve_at, "Immediate auto-resolve should work");
+}
+
+// ── #35 – All-or-nothing batch payouts ─────────────────────────────────────
+
+/// A batch with enough funding pays every recipient and records the split
+/// totals exactly once.
+#[test]
+fn test_batch_distribution_success_is_consistent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let agency = Address::generate(&env);
+    let artist = Address::generate(&env);
+    let other = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token).mint(&agency, &10_000);
+
+    let contract_id = env.register_contract(None, CommissionAgreementContract);
+    let client = CommissionAgreementContractClient::new(&env, &contract_id);
+    client.register_agency(&agency, &String::from_str(&env, "Northlight"), &2_000);
+    client.add_artist(&agency, &artist, &2_000);
+    client.add_artist(&agency, &other, &1_000);
+
+    let total = client.distribute_batch(
+        &agency,
+        &token,
+        &vec![
+            &env,
+            BatchPayment {
+                artist: artist.clone(),
+                gross_usdc: 1_000,
+            },
+            BatchPayment {
+                artist: other.clone(),
+                gross_usdc: 500,
+            },
+        ],
+    );
+    assert_eq!(total, 1_500);
+
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&artist), 800);
+    assert_eq!(token_client.balance(&other), 450);
+    assert_eq!(token_client.balance(&agency), 10_000 - 1_250);
+
+    let analytics = client.get_agency_analytics(&agency);
+    assert_eq!(analytics.batches, 1);
+    assert_eq!(analytics.gross_distributed, 1_500);
+    assert_eq!(analytics.agency_revenue, 250);
+    assert_eq!(analytics.artist_payouts, 1_250);
+}
+
+/// The second recipient's leg is rejected because the agency cannot cover the
+/// whole batch. The first leg must be rolled back with the roster and analytics
+/// effects, leaving no partial payment behind.
+#[test]
+fn test_batch_distribution_failure_rolls_back_every_leg() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let agency = Address::generate(&env);
+    let artist = Address::generate(&env);
+    let other = Address::generate(&env);
+    // Enough for the first net (800) but not for both nets (1 250).
+    token::StellarAssetClient::new(&env, &token).mint(&agency, &1_000);
+
+    let contract_id = env.register_contract(None, CommissionAgreementContract);
+    let client = CommissionAgreementContractClient::new(&env, &contract_id);
+    client.register_agency(&agency, &String::from_str(&env, "Northlight"), &2_000);
+    client.add_artist(&agency, &artist, &2_000);
+    client.add_artist(&agency, &other, &1_000);
+
+    let err = client
+        .try_distribute_batch(
+            &agency,
+            &token,
+            &vec![
+                &env,
+                BatchPayment {
+                    artist: artist.clone(),
+                    gross_usdc: 1_000,
+                },
+                BatchPayment {
+                    artist: other.clone(),
+                    gross_usdc: 500,
+                },
+            ],
+        )
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, AgreementError::BatchTransferFailed);
+
+    // No token moved, including the leg that succeeded before the rejection.
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&artist), 0);
+    assert_eq!(token_client.balance(&other), 0);
+    assert_eq!(token_client.balance(&agency), 1_000);
+
+    // Roster membership and split history are untouched.
+    assert_eq!(client.get_roster(&agency).len(), 2);
+    for who in [&artist, &other] {
+        let entry = client.get_roster_entry(&agency, who);
+        assert_eq!(entry.gross_distributed, 0);
+        assert_eq!(entry.agency_revenue, 0);
+        assert_eq!(entry.artist_payouts, 0);
+    }
+    let analytics = client.get_agency_analytics(&agency);
+    assert_eq!(analytics.batches, 0);
+    assert_eq!(analytics.gross_distributed, 0);
+    assert_eq!(analytics.agency_revenue, 0);
+    assert_eq!(analytics.artist_payouts, 0);
 }

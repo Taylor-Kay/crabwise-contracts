@@ -435,6 +435,98 @@ fn unknown_accounts_and_tiers_are_reported() {
     );
 }
 
+// ── Issue #63: Define subscription expiration at the ledger boundary ─────────
+
+#[test]
+fn subscription_active_before_expiration_expired_after() {
+    let f = setup();
+    f.subscribed(false); // cancelled auto-renew — no grace window
+    let end = f.client.get_subscription(&f.member).period_end_ledger;
+
+    // One ledger before expiration: still active.
+    f.env.ledger().with_mut(|l| l.sequence_number = end - 1);
+    assert!(f.client.is_active(&f.member));
+
+    // Exactly at the expiration ledger: still covered (<=).
+    f.env.ledger().with_mut(|l| l.sequence_number = end);
+    assert!(f.client.is_active(&f.member));
+
+    // One ledger after: coverage is gone.
+    f.env.ledger().with_mut(|l| l.sequence_number = end + 1);
+    assert!(!f.client.is_active(&f.member));
+// ── Issue #62: Settle subscription credits exactly once ─────────────────────
+
+#[test]
+fn duplicate_credit_deposit_does_not_pay_twice() {
+    let f = setup();
+    f.create_tiers();
+
+    // Deposit exactly one period's worth of credit.
+    f.client.deposit(&f.member, &BASIC_PRICE);
+
+    // Subscribe with the available credit.
+    f.client.subscribe(&f.member, &BASIC, &true);
+
+    // Credit should now be zero.
+    assert_eq!(f.client.get_credit(&f.member), 0);
+
+    // Attempting to subscribe again (a duplicate claim) must be rejected —
+    // balance and event stream must not change a second time.
+    let err = f
+        .client
+        .try_subscribe(&f.member, &BASIC, &true)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, SubscriptionError::AlreadySubscribed);
+
+    // Balance is unchanged after the rejected duplicate.
+    assert_eq!(f.client.get_credit(&f.member), 0);
+
+    // Payment history records exactly one entry.
+    let payments = f.client.get_payments(&f.member);
+    assert_eq!(payments.len(), 1);
+    assert_eq!(payments.get(0).unwrap().kind, PaymentKind::Initial);
+// ── Issue #61: Reject subscription plans with invalid prices ────────────────
+
+#[test]
+fn invalid_plan_prices_are_rejected_and_do_not_replace_existing_tier() {
+    let f = setup();
+    let name = String::from_str(&f.env, "Invalid");
+
+    // Zero price must be rejected.
+    let err = f
+        .client
+        .try_create_tier(&99, &name, &0, &PERIOD, &Vec::new(&f.env))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, SubscriptionError::InvalidPrice);
+
+    // Negative price must also be rejected.
+    let err = f
+        .client
+        .try_create_tier(&99, &name, &-1, &PERIOD, &Vec::new(&f.env))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, SubscriptionError::InvalidPrice);
+
+    // No tier should have been created by either invalid attempt.
+    let err = f.client.try_get_tier(&99).err().unwrap().unwrap();
+    assert_eq!(err, SubscriptionError::TierNotFound);
+
+    // A valid price must succeed.
+    f.client.create_tier(
+        &99,
+        &name,
+        &1,
+        &PERIOD,
+        &Vec::new(&f.env),
+    );
+    assert_eq!(f.client.get_tier(&99).price, 1);
+}
+
 #[test]
 fn only_the_admin_manages_tiers() {
     let f = setup();

@@ -50,6 +50,54 @@ fn load_aggregate(env: &Env, subject: &Address) -> ReviewAggregate {
         })
 }
 
+/// Refresh the retention of a review that is part of an active moderation
+/// workflow (#054).
+///
+/// Reports, moderation and appeals rewrite the review with `set`, which resets
+/// its TTL to the host default. Refreshing to [`REPUTATION_TTL_LEDGERS`] here
+/// keeps the review available while its report or appeal is being decided,
+/// instead of letting the record expire mid-workflow.
+fn extend_review_ttl(env: &Env, review_id: &Bytes) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::Review(review_id.clone()),
+        REPUTATION_TTL_LEDGERS,
+        REPUTATION_TTL_LEDGERS,
+    );
+}
+
+/// Refresh the retention of an appeal while it is still open (#054).
+fn extend_appeal_ttl(env: &Env, review_id: &Bytes) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::Appeal(review_id.clone()),
+        REPUTATION_TTL_LEDGERS,
+        REPUTATION_TTL_LEDGERS,
+    );
+/// Whether `reporter` already reported `review_id` among its first `count`
+/// reports (#050).
+///
+/// Report records are kept after a review is dismissed (`Cleared`), so waiting
+/// for moderation to clear the review does not reset a reporter's slot.
+fn reporter_has_reported(
+    env: &Env,
+    review_id: &Bytes,
+    reporter: &Address,
+    count: u32,
+) -> bool {
+    for i in 0..count {
+        let key = DataKey::Report(review_id.clone(), i);
+        if let Some(record) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ReportRecord>(&key)
+        {
+            if record.reporter == *reporter {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn save_aggregate(env: &Env, aggregate: &ReviewAggregate) {
     let key = DataKey::Aggregate(aggregate.subject.clone());
     env.storage().persistent().set(&key, aggregate);
@@ -64,6 +112,23 @@ fn configured_appeal_window(env: &Env) -> u32 {
         .instance()
         .get(&DataKey::AppealWindowLedgers)
         .unwrap_or(DEFAULT_APPEAL_WINDOW_LEDGERS)
+}
+
+/// Last ledger on which `review` may be appealed (#051).
+///
+/// The window is inclusive: a filing at exactly this ledger is accepted, and
+/// the first ledger after it is rejected. Both the filing path and the
+/// deadline getters use this so the boundary is defined in one place.
+fn appeal_deadline(env: &Env, review: &ReviewRecord) -> u32 {
+    review
+        .created_ledger
+        .saturating_add(configured_appeal_window(env))
+}
+
+/// Whether the appeal window ending at `deadline` is still open at the current
+/// ledger (#051).
+fn appeal_window_open(env: &Env, deadline: u32) -> bool {
+    env.ledger().sequence() <= deadline
 }
 
 #[contract]
@@ -96,8 +161,19 @@ impl ReputationContract {
         if !(10..=50).contains(&rating_x10) {
             return Err(ReputationError::InvalidRating);
         }
+
+        // #48: `(artist, reviewer)` is the unique review key — a client may
+        // leave at most one review for a given artist, whatever review id they
+        // choose. Checking it before anything is written means a duplicate can
+        // never inflate the subject's aggregate.
+        let reviewer_key = DataKey::ReviewerIndex(artist.clone(), reviewer.clone());
+        if env.storage().persistent().has(&reviewer_key) {
+            return Err(ReputationError::DuplicateReview);
+        }
+        // Review ids are also unique; reusing one would overwrite the stored
+        // record belonging to another submission.
         if env.storage().persistent().has(&DataKey::Review(review_id.clone())) {
-            return Err(ReputationError::AlreadyReported);
+            return Err(ReputationError::DuplicateReview);
         }
 
         let record = ReviewRecord {
@@ -112,6 +188,17 @@ impl ReputationContract {
         env.storage().persistent().set(&DataKey::Review(review_id.clone()), &record);
         env.storage().persistent().extend_ttl(
             &DataKey::Review(review_id.clone()),
+            REPUTATION_TTL_LEDGERS,
+            REPUTATION_TTL_LEDGERS,
+        );
+        // Deliberately not cleared when a review is removed by moderation: a
+        // client whose review was taken down must not be able to file a fresh
+        // rating for the same artist and re-inflate the aggregate.
+        env.storage()
+            .persistent()
+            .set(&reviewer_key, &review_id);
+        env.storage().persistent().extend_ttl(
+            &reviewer_key,
             REPUTATION_TTL_LEDGERS,
             REPUTATION_TTL_LEDGERS,
         );
@@ -156,19 +243,18 @@ impl ReputationContract {
             .persistent()
             .get(&DataKey::ReportCount(review_id.clone()))
             .unwrap_or(0u32);
-        for i in 0..count {
-            let r: ReportRecord = env.storage()
-                .persistent()
-                .get(&DataKey::Report(review_id.clone(), i))
-                .unwrap();
-            if r.reporter == reporter {
-                return Err(ReputationError::AlreadyReported);
-            }
+        // #050: one report per reporter per review. The check covers every
+        // stored report, including reports whose review was later dismissed,
+        // so a reporter cannot regain a slot by being cleared.
+        if reporter_has_reported(&env, &review_id, &reporter, count) {
+            return Err(ReputationError::AlreadyReported);
         }
 
         // #976: bound the queue before writing. The queue is instance storage
         // that anyone can drive with `report_review`, so its growth is capped
-        // both globally and per review.
+        // both globally and per review. #050 keeps the per-review cap counting
+        // reports from dismissed rounds as well: clearing a review does not
+        // reset its report budget.
         if count >= MAX_REPORTS_PER_REVIEW {
             return Err(ReputationError::ReportLimitReached);
         }
@@ -212,6 +298,7 @@ impl ReputationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Review(review_id.clone()), &review);
+        extend_review_ttl(&env, &review_id);
 
         let queue_size: u32 = env.storage()
             .instance()
@@ -259,23 +346,25 @@ impl ReputationContract {
         }
 
         // Status is guaranteed `UnderReview` here, so the review is currently
-        // active; removing it takes it out of the active average.
-        review.status = new_status.clone();
+        // active; removing it takes it out of the active average while a
+        // `Cleared` review keeps its rating.
+        let previous_status = review.status;
         review.status = new_status;
         env.storage()
             .persistent()
             .set(&DataKey::Review(review_id.clone()), &review);
+        extend_review_ttl(&env, &review_id);
 
-        // #974: moderation changes the score intentionally — removing a review
-        // takes it out of the active average; clearing it leaves the rating in
-        // place.
+        // #49: the aggregate adjustment is derived from the stored transition
+        // in `score.rs`, so moderation can only move it once per status change.
         let mut aggregate = load_aggregate(&env, &review.artist);
         aggregate.moderation_count = aggregate.moderation_count.saturating_add(1);
-        if new_status == ReviewStatus::Removed {
-            aggregate.active_reviews = aggregate.active_reviews.saturating_sub(1);
-            aggregate.rating_sum = aggregate.rating_sum.saturating_sub(review.rating_x10);
-            aggregate.removed_reviews = aggregate.removed_reviews.saturating_add(1);
-        }
+        score::apply_review_status_change(
+            &mut aggregate,
+            review.rating_x10,
+            previous_status,
+            new_status,
+        );
         save_aggregate(&env, &aggregate);
 
         let mod_count: u32 = env.storage()
@@ -353,11 +442,11 @@ impl ReputationContract {
             return Err(ReputationError::AppealAlreadyExists);
         }
 
-        // #976: filing is bounded by the review's appeal window. The deadline
-        // ledger itself is still inside the window; only a chain that has moved
-        // past it rejects the appeal.
-        let deadline = review.created_ledger.saturating_add(configured_appeal_window(&env));
-        if env.ledger().sequence() > deadline {
+        // #976/#051: filing is bounded by the review's appeal window. The
+        // deadline ledger itself is still inside the window; only a chain that
+        // has moved past it rejects the appeal.
+        let deadline = appeal_deadline(&env, &review);
+        if !appeal_window_open(&env, deadline) {
             return Err(ReputationError::AppealWindowClosed);
         }
 
@@ -370,11 +459,10 @@ impl ReputationContract {
             window_deadline_ledger: deadline,
         };
         env.storage().persistent().set(&DataKey::Appeal(review_id.clone()), &appeal);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Appeal(review_id.clone()),
-            REPUTATION_TTL_LEDGERS,
-            REPUTATION_TTL_LEDGERS,
-        );
+        // The appeal is open: keep both it and the review it targets retained
+        // while the admin decides (#054).
+        extend_appeal_ttl(&env, &review_id);
+        extend_review_ttl(&env, &review_id);
 
         let mut aggregate = load_aggregate(&env, &review.artist);
         aggregate.appeal_count = aggregate.appeal_count.saturating_add(1);
@@ -406,23 +494,28 @@ impl ReputationContract {
 
         appeal.status = decision;
         env.storage().persistent().set(&DataKey::Appeal(review_id.clone()), &appeal);
+        extend_appeal_ttl(&env, &review_id);
 
         if decision == AppealStatus::Upheld {
             let mut review: ReviewRecord = env.storage()
                 .persistent()
                 .get(&DataKey::Review(review_id.clone()))
                 .ok_or(ReputationError::ReviewNotFound)?;
-            let was_removed = review.status == ReviewStatus::Removed;
+            let previous_status = review.status;
             review.status = ReviewStatus::Active;
             env.storage().persistent().set(&DataKey::Review(review_id.clone()), &review);
+            extend_review_ttl(&env, &review_id);
 
-            // #974: a successful appeal reinstates a removed rating, so the
-            // subject's aggregate moves back in step with the review.
-            if was_removed {
-                let mut aggregate = load_aggregate(&env, &review.artist);
-                aggregate.active_reviews = aggregate.active_reviews.saturating_add(1);
-                aggregate.rating_sum = aggregate.rating_sum.saturating_add(review.rating_x10);
-                aggregate.removed_reviews = aggregate.removed_reviews.saturating_sub(1);
+            // #49: a successful appeal reinstates a removed rating. The shared
+            // helper decides whether anything actually moved, so resolving an
+            // appeal on a review that was never removed is a no-op.
+            let mut aggregate = load_aggregate(&env, &review.artist);
+            if score::apply_review_status_change(
+                &mut aggregate,
+                review.rating_x10,
+                previous_status,
+                ReviewStatus::Active,
+            ) {
                 save_aggregate(&env, &aggregate);
             }
         }
@@ -473,6 +566,7 @@ impl ReputationContract {
 
         appeal.status = AppealStatus::Escalated;
         env.storage().persistent().set(&DataKey::Appeal(review_id.clone()), &appeal);
+        extend_appeal_ttl(&env, &review_id);
 
         env.events().publish((symbol_short!("escalated"),), (review_id, appellant));
         Ok(())
@@ -532,14 +626,15 @@ impl ReputationContract {
             .persistent()
             .get(&DataKey::Review(review_id))
             .ok_or(ReputationError::ReviewNotFound)?;
-        Ok(review
-            .created_ledger
-            .saturating_add(configured_appeal_window(&env)))
+        Ok(appeal_deadline(&env, &review))
     }
 
-    /// Ledgers left to file an appeal for `review_id`; `0` once the window has
-    /// closed. Lets a client tell a user "you have N ledgers left" instead of
-    /// surfacing the refusal at filing time (#976).
+    /// Ledgers left to file an appeal for `review_id`.
+    ///
+    /// `0` means the current ledger is the final allowed ledger or the window
+    /// has already closed; the inclusive boundary means a filing at `0` still
+    /// succeeds (#051). Lets a client tell a user "you have N ledgers left"
+    /// instead of surfacing the refusal at filing time (#976).
     pub fn ledgers_to_appeal(env: Env, review_id: Bytes) -> Result<u32, ReputationError> {
         let deadline = Self::get_appeal_deadline(env.clone(), review_id)?;
         Ok(deadline.saturating_sub(env.ledger().sequence()))
